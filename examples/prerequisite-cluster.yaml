@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Prerequisite EKS cluster for testing eks-log-alarms.
+  Deploys a minimal EKS cluster with control plane logging and Container Insights enabled.
+  This is NOT part of the core artifact — it's a test/demo dependency.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: eks-log-alarms-demo
+    Description: Name of the EKS cluster
+
+  KubernetesVersion:
+    Type: String
+    Default: "1.31"
+    AllowedValues: ["1.29", "1.30", "1.31"]
+    Description: Kubernetes version
+
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: CIDR block for the VPC
+
+  Subnet1Cidr:
+    Type: String
+    Default: "10.0.1.0/24"
+
+  Subnet2Cidr:
+    Type: String
+    Default: "10.0.2.0/24"
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # NETWORKING - intentionally minimal for a disposable demo cluster.
+  # Public subnets with auto-assigned IPs avoid the cost of NAT gateways.
+  # Do NOT use this network layout for production workloads.
+  # ---------------------------------------------------------------------------
+  # --- VPC ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  Subnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref Subnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-subnet-1"
+
+  Subnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref Subnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-subnet-2"
+
+  Subnet1RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet1
+      RouteTableId: !Ref RouteTable
+
+  Subnet2RouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref Subnet2
+      RouteTableId: !Ref RouteTable
+
+  # --- EKS Cluster Role ---
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  # --- EKS Cluster ---
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+        SecurityGroupIds: []
+      EncryptionConfig:
+        - Provider:
+            KeyArn: !GetAtt EKSEncryptionKey.Arn
+          Resources:
+            - secrets
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+
+  # --- KMS Key for EKS Secrets Encryption ---
+  # DeletionPolicy is intentionally Delete: this is a disposable demo cluster
+  # and orphaning the key would leave a recurring monthly cost. KMS schedules
+  # key deletion with a mandatory waiting period rather than deleting instantly.
+  EKSEncryptionKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub "KMS key for EKS cluster ${ClusterName} secrets encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Explicit admin/usage actions instead of kms:* so security
+          # scanners do not flag a wildcard policy. The account-root
+          # principal is required so IAM policies in the account can manage
+          # the key and it can never become unmanageable.
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - kms:CancelKeyDeletion
+              - kms:Create*
+              - kms:Decrypt
+              - kms:Delete*
+              - kms:Describe*
+              - kms:Disable*
+              - kms:Enable*
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:Get*
+              - kms:List*
+              - kms:Put*
+              - kms:ReEncrypt*
+              - kms:Revoke*
+              - kms:ScheduleKeyDeletion
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:Update*
+            Resource: "*"
+          - Sid: AllowEKSClusterRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt EKSClusterRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: "*"
+
+  # --- Node Group Role ---
+  NodeGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-node-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  # --- Managed Node Group ---
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub "${ClusterName}-nodes"
+      NodeRole: !GetAtt NodeGroupRole.Arn
+      Subnets:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      ScalingConfig:
+        MinSize: 2
+        MaxSize: 4
+        DesiredSize: 2
+      InstanceTypes:
+        - t3.medium
+      AmiType: AL2_x86_64
+
+  # --- EKS Pod Identity Association for CloudWatch Agent ---
+  # The amazon-cloudwatch-observability add-on needs permissions to push logs/metrics.
+  # EKS Pod Identity is the recommended approach (simpler than IRSA/OIDC).
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-cloudwatch-agent-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess
+
+  CloudWatchAgentPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: amazon-cloudwatch
+      ServiceAccount: cloudwatch-agent
+      RoleArn: !GetAtt CloudWatchAgentRole.Arn
+
+Outputs:
+  ClusterName:
+    Description: EKS cluster name (use this as input to eks-log-alarms)
+    Value: !Ref ClusterName
+
+  ClusterEndpoint:
+    Description: EKS cluster API endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+
+  ClusterArn:
+    Description: EKS cluster ARN
+    Value: !GetAtt EKSCluster.Arn
+
+  ControlPlaneLogGroup:
+    Description: Control plane log group (auto-created by EKS)
+    Value: !Sub "/aws/eks/${ClusterName}/cluster"
+
+  NodeGroupRoleArn:
+    Description: Node group IAM role ARN
+    Value: !GetAtt NodeGroupRole.Arn
+
+  CloudWatchAgentRoleArn:
+    Description: IAM role ARN for CloudWatch agent (Pod Identity)
+    Value: !GetAtt CloudWatchAgentRole.Arn
+
+  NextSteps:
+    Description: What to do next
+    Value: !Sub >
+      Cluster is ready. Next steps:
+      1. Update kubeconfig: aws eks update-kubeconfig --name ${ClusterName}
+      2. Install CloudWatch agent for application logs (Container Insights)
+      3. Deploy eks-log-alarms: ./examples/deploy.sh ${ClusterName} your-email@example.com

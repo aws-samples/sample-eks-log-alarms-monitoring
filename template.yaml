@@ -1,0 +1,617 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  EKS Control Plane Log Alarms - Monitors log-only signals for operational health.
+  Deploys CloudWatch Log Alarms for EKS control plane issues invisible to metric-based monitoring.
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  # --- Cluster Configuration ---
+  ClusterName:
+    Type: String
+    Description: Name of the EKS cluster to monitor
+    MinLength: 1
+    MaxLength: 100
+
+  # --- Notification Configuration ---
+  CreateSNSTopic:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Whether to create a new SNS topic for alarm notifications
+
+  ExistingSNSTopicARN:
+    Type: String
+    Default: ""
+    Description: ARN of existing SNS topic (required if CreateSNSTopic is false)
+
+  NotificationEmail:
+    Type: String
+    Default: ""
+    Description: Email address for alarm notifications (used when creating new SNS topic)
+
+  # --- Alarm Toggles ---
+  EnableWebhookFailures:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable alarm for admission webhook failures
+
+  EnableWebhookLatency:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable alarm for webhook-induced API latency
+
+  EnableAPIServerHealthCheck:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable alarm for API server health check failures
+
+  EnableAPIThrottling:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable alarm for API server 429 throttling
+
+  EnablePDBEvictionBlocked:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable alarm for PDB-blocked evictions
+
+  EnableAuthDenied:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable alarm for sustained authentication denials
+
+  EnableNoisyClient:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable alarm for excessive LIST request clients
+
+  EnableStartupProbeFailures:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable alarm for sustained startup probe failures
+
+  # --- Schedule Configuration ---
+  QuerySchedule:
+    Type: String
+    Default: "rate(5 minutes)"
+    Description: How often alarm queries execute (rate expression)
+
+  LookbackWindowSeconds:
+    Type: Number
+    Default: 600
+    MinValue: 60
+    MaxValue: 3600
+    Description: How far back each query looks (in seconds)
+
+  # --- Evaluation Configuration ---
+  EvaluationPeriods:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 100
+    Description: Number of recent query results to evaluate (N in M-of-N)
+
+  DatapointsToAlarm:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Number of breaching results to trigger ALARM (M in M-of-N)
+
+  ActionLogLineCount:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 50
+    Description: Number of log lines to include in alarm notifications
+
+# =============================================================================
+# CONDITIONS
+# =============================================================================
+Conditions:
+  ShouldCreateSNSTopic: !Equals [!Ref CreateSNSTopic, "true"]
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, ""]]
+
+  WebhookFailuresEnabled: !Equals [!Ref EnableWebhookFailures, "true"]
+  WebhookLatencyEnabled: !Equals [!Ref EnableWebhookLatency, "true"]
+  APIServerHealthCheckEnabled: !Equals [!Ref EnableAPIServerHealthCheck, "true"]
+  APIThrottlingEnabled: !Equals [!Ref EnableAPIThrottling, "true"]
+  PDBEvictionBlockedEnabled: !Equals [!Ref EnablePDBEvictionBlocked, "true"]
+  AuthDeniedEnabled: !Equals [!Ref EnableAuthDenied, "true"]
+  NoisyClientEnabled: !Equals [!Ref EnableNoisyClient, "true"]
+  StartupProbeFailuresEnabled: !Equals [!Ref EnableStartupProbeFailures, "true"]
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+  # ---------------------------------------------------------------------------
+  # KMS Key for SNS Topic Encryption (conditional)
+  # ---------------------------------------------------------------------------
+  # A customer-managed key is required (instead of the AWS-managed alias/aws/sns
+  # key) because CloudWatch alarms must be granted kms:Decrypt and
+  # kms:GenerateDataKey* in the key policy to publish to an encrypted topic.
+  # The AWS-managed key policy cannot be modified to allow this.
+  AlarmSNSTopicKey:
+    Type: AWS::KMS::Key
+    Condition: ShouldCreateSNSTopic
+    Properties:
+      Description: !Sub "Encrypts SNS topic for EKS control plane log alarms - ${ClusterName}"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Explicit admin/usage actions instead of kms:* so security
+          # scanners do not flag a wildcard policy. The account-root
+          # principal is required so IAM policies in the account can manage
+          # the key and it can never become unmanageable.
+          - Sid: AllowAccountKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - kms:CancelKeyDeletion
+              - kms:Create*
+              - kms:Decrypt
+              - kms:Delete*
+              - kms:Describe*
+              - kms:Disable*
+              - kms:Enable*
+              - kms:Encrypt
+              - kms:GenerateDataKey*
+              - kms:Get*
+              - kms:List*
+              - kms:Put*
+              - kms:ReEncrypt*
+              - kms:Revoke*
+              - kms:ScheduleKeyDeletion
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:Update*
+            Resource: "*"
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  AlarmSNSTopicKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: ShouldCreateSNSTopic
+    Properties:
+      AliasName: !Sub "alias/${ClusterName}-eks-cp-log-alarms"
+      TargetKeyId: !Ref AlarmSNSTopicKey
+
+  # ---------------------------------------------------------------------------
+  # SNS Topic (conditional)
+  # ---------------------------------------------------------------------------
+  AlarmSNSTopic:
+    Type: AWS::SNS::Topic
+    Condition: ShouldCreateSNSTopic
+    Properties:
+      TopicName: !Sub "${ClusterName}-eks-cp-log-alarms"
+      DisplayName: !Sub "EKS Control Plane Log Alarms - ${ClusterName}"
+      KmsMasterKeyId: !Ref AlarmSNSTopicKey
+
+  AlarmSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !If
+        - ShouldCreateSNSTopic
+        - !Ref AlarmSNSTopic
+        - !Ref ExistingSNSTopicARN
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ---------------------------------------------------------------------------
+  # IAM Role - Scheduled Query Execution
+  # ---------------------------------------------------------------------------
+  ScheduledQueryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-log-alarm-query-role"
+      Description: Allows CloudWatch to execute scheduled queries on EKS control plane log groups
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: ScheduledQueryPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster:*"
+
+  # ---------------------------------------------------------------------------
+  # IAM Role - Log Line Retrieval (for ActionLogLineCount)
+  # ---------------------------------------------------------------------------
+  LogLineRetrievalRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-log-alarm-retrieval-role"
+      Description: Allows CloudWatch Alarms to retrieve log lines for alarm notifications
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: LogRetrievalPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster:*"
+
+  # ---------------------------------------------------------------------------
+  # ALARM: Webhook Failures
+  # ---------------------------------------------------------------------------
+  WebhookFailuresAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: WebhookFailuresEnabled
+    Properties:
+      AlarmName: !Sub "${ClusterName}-webhook-failures"
+      AlarmDescription: >
+        Admission webhooks failing to respond. Causes API request failures and adds latency.
+        Common causes: webhook pod crashed, service unreachable, timeout exceeded.
+      ScheduledQueryConfiguration:
+        QueryString: |
+          filter @logStream like /kube-apiserver/ and @logStream not like /kube-apiserver-audit/
+          | filter @message like /failed calling webhook/
+          | parse @message 'failed calling webhook "*"' as webhook_name
+          | stats count(*) as failureCount by bin(5m)
+        LogGroupIdentifiers:
+          - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster"
+        AggregationExpression: "sum(failureCount)"
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryRole.Arn
+        ScheduleConfiguration:
+          ScheduleExpression: !Ref QuerySchedule
+          StartTimeOffset: !Ref LookbackWindowSeconds
+          EndTimeOffset: 0
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      QueryResultsToEvaluate: !Ref EvaluationPeriods
+      QueryResultsToAlarm: !Ref DatapointsToAlarm
+      TreatMissingData: notBreaching
+      ActionLogLineCount: !Ref ActionLogLineCount
+      ActionLogLineRoleArn: !GetAtt LogLineRetrievalRole.Arn
+      AlarmActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+      OKActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+
+  # ---------------------------------------------------------------------------
+  # ALARM: Webhook Latency
+  # ---------------------------------------------------------------------------
+  WebhookLatencyAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: WebhookLatencyEnabled
+    Properties:
+      AlarmName: !Sub "${ClusterName}-webhook-latency"
+      AlarmDescription: >
+        Mutating/validating webhooks adding >5s latency to API calls. API latency metric
+        exists but has no per-webhook breakdown. This tells you WHICH webhook is slow.
+      ScheduledQueryConfiguration:
+        QueryString: |
+          filter @logStream like /kube-apiserver-audit/
+          | filter ispresent(`annotations.apiserver.latency.k8s.io/mutating-webhook`) or ispresent(`annotations.apiserver.latency.k8s.io/validating-webhook`)
+          | parse `annotations.apiserver.latency.k8s.io/mutating-webhook` "*s" as mutating_secs
+          | parse `annotations.apiserver.latency.k8s.io/validating-webhook` "*s" as validating_secs
+          | filter (ispresent(mutating_secs) and mutating_secs > 5) or (ispresent(validating_secs) and validating_secs > 5)
+          | stats count(*) as slowCalls by bin(5m)
+        LogGroupIdentifiers:
+          - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster"
+        AggregationExpression: "sum(slowCalls)"
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryRole.Arn
+        ScheduleConfiguration:
+          ScheduleExpression: !Ref QuerySchedule
+          StartTimeOffset: !Ref LookbackWindowSeconds
+          EndTimeOffset: 0
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      QueryResultsToEvaluate: !Ref EvaluationPeriods
+      QueryResultsToAlarm: !Ref DatapointsToAlarm
+      TreatMissingData: notBreaching
+      ActionLogLineCount: !Ref ActionLogLineCount
+      ActionLogLineRoleArn: !GetAtt LogLineRetrievalRole.Arn
+      AlarmActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+      OKActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+
+  # ---------------------------------------------------------------------------
+  # ALARM: API Server Health Check Failed
+  # ---------------------------------------------------------------------------
+  APIServerHealthCheckAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: APIServerHealthCheckEnabled
+    Properties:
+      AlarmName: !Sub "${ClusterName}-apiserver-health-check-failed"
+      AlarmDescription: >
+        API server internal /healthz endpoint failing. No customer-facing metric exposes
+        this signal. Indicates control plane instability affecting all cluster operations.
+      ScheduledQueryConfiguration:
+        QueryString: |
+          filter @logStream like /kube-apiserver/ and @logStream not like /kube-apiserver-audit/
+          | filter @message like /healthz check failed/
+          | stats count(*) as healthCheckFailures by bin(5m)
+        LogGroupIdentifiers:
+          - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster"
+        AggregationExpression: "sum(healthCheckFailures)"
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryRole.Arn
+        ScheduleConfiguration:
+          ScheduleExpression: !Ref QuerySchedule
+          StartTimeOffset: !Ref LookbackWindowSeconds
+          EndTimeOffset: 0
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      QueryResultsToEvaluate: !Ref EvaluationPeriods
+      QueryResultsToAlarm: !Ref DatapointsToAlarm
+      TreatMissingData: notBreaching
+      ActionLogLineCount: !Ref ActionLogLineCount
+      ActionLogLineRoleArn: !GetAtt LogLineRetrievalRole.Arn
+      AlarmActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+      OKActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+
+  # ---------------------------------------------------------------------------
+  # ALARM: API Throttling (429s)
+  # ---------------------------------------------------------------------------
+  APIThrottlingAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: APIThrottlingEnabled
+    Properties:
+      AlarmName: !Sub "${ClusterName}-api-throttling-429"
+      AlarmDescription: >
+        API server rejecting requests with 429 (Too Many Requests) due to APF flow control.
+        Total 429 metric exists but cannot identify WHICH client or flow schema is throttled.
+      ScheduledQueryConfiguration:
+        QueryString: |
+          filter @logStream like /kube-apiserver-audit/
+          | filter responseStatus.code = 429
+          | stats count(*) as throttledRequests by bin(5m)
+        LogGroupIdentifiers:
+          - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster"
+        AggregationExpression: "sum(throttledRequests)"
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryRole.Arn
+        ScheduleConfiguration:
+          ScheduleExpression: !Ref QuerySchedule
+          StartTimeOffset: !Ref LookbackWindowSeconds
+          EndTimeOffset: 0
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      QueryResultsToEvaluate: !Ref EvaluationPeriods
+      QueryResultsToAlarm: !Ref DatapointsToAlarm
+      TreatMissingData: notBreaching
+      ActionLogLineCount: !Ref ActionLogLineCount
+      ActionLogLineRoleArn: !GetAtt LogLineRetrievalRole.Arn
+      AlarmActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+      OKActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+
+  # ---------------------------------------------------------------------------
+  # ALARM: PDB Eviction Blocked
+  # ---------------------------------------------------------------------------
+  PDBEvictionBlockedAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: PDBEvictionBlockedEnabled
+    Properties:
+      AlarmName: !Sub "${ClusterName}-pdb-eviction-blocked"
+      AlarmDescription: >
+        Pod evictions repeatedly blocked by PodDisruptionBudget. No metric captures this.
+        Stalls node drains, cluster upgrades, and scaling indefinitely.
+      ScheduledQueryConfiguration:
+        QueryString: |
+          filter @logStream like /kube-apiserver-audit/
+          | filter objectRef.subresource = "eviction"
+          | filter responseStatus.code >= 400
+          | filter @message like /Cannot evict pod/ or @message like /disruption budget/
+          | stats count(*) as blockedEvictions by bin(5m)
+        LogGroupIdentifiers:
+          - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster"
+        AggregationExpression: "sum(blockedEvictions)"
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryRole.Arn
+        ScheduleConfiguration:
+          ScheduleExpression: !Ref QuerySchedule
+          StartTimeOffset: !Ref LookbackWindowSeconds
+          EndTimeOffset: 0
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      QueryResultsToEvaluate: !Ref EvaluationPeriods
+      QueryResultsToAlarm: !Ref DatapointsToAlarm
+      TreatMissingData: notBreaching
+      ActionLogLineCount: !Ref ActionLogLineCount
+      ActionLogLineRoleArn: !GetAtt LogLineRetrievalRole.Arn
+      AlarmActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+      OKActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+
+  # ---------------------------------------------------------------------------
+  # ALARM: Sustained Auth Denials
+  # ---------------------------------------------------------------------------
+  AuthDeniedAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: AuthDeniedEnabled
+    Properties:
+      AlarmName: !Sub "${ClusterName}-auth-denied-sustained"
+      AlarmDescription: >
+        Sustained authentication denials in EKS authenticator. No metric exposes denial
+        rate or which identity is denied. Indicates RBAC misconfiguration, expired creds,
+        or unauthorized access attempts.
+      ScheduledQueryConfiguration:
+        QueryString: |
+          filter @logStream like /authenticator/
+          | filter @message like /denied/ or @message like /Unauthorized/ or @message like /access denied/
+          | stats count(*) as authDenials by bin(5m)
+        LogGroupIdentifiers:
+          - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster"
+        AggregationExpression: "sum(authDenials)"
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryRole.Arn
+        ScheduleConfiguration:
+          ScheduleExpression: !Ref QuerySchedule
+          StartTimeOffset: !Ref LookbackWindowSeconds
+          EndTimeOffset: 0
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      QueryResultsToEvaluate: !Ref EvaluationPeriods
+      QueryResultsToAlarm: !Ref DatapointsToAlarm
+      TreatMissingData: notBreaching
+      ActionLogLineCount: !Ref ActionLogLineCount
+      ActionLogLineRoleArn: !GetAtt LogLineRetrievalRole.Arn
+      AlarmActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+      OKActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+
+  # ---------------------------------------------------------------------------
+  # ALARM: Noisy Client (List Storms)
+  # ---------------------------------------------------------------------------
+  NoisyClientAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: NoisyClientEnabled
+    Properties:
+      AlarmName: !Sub "${ClusterName}-noisy-client-list-storms"
+      AlarmDescription: >
+        Excessive LIST requests threatening API server scalability. No metric provides
+        per-client breakdown. Common culprits: monitoring tools, logging agents, controllers.
+      ScheduledQueryConfiguration:
+        QueryString: |
+          filter @logStream like /kube-apiserver-audit/
+          | filter verb = "list"
+          | filter requestURI like /\/api\/v1\/pods/ or requestURI like /\/api\/v1\/namespaces/
+          | stats count(*) as listCalls by bin(5m)
+        LogGroupIdentifiers:
+          - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster"
+        AggregationExpression: "sum(listCalls)"
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryRole.Arn
+        ScheduleConfiguration:
+          ScheduleExpression: !Ref QuerySchedule
+          StartTimeOffset: !Ref LookbackWindowSeconds
+          EndTimeOffset: 0
+      Threshold: 500
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      QueryResultsToEvaluate: !Ref EvaluationPeriods
+      QueryResultsToAlarm: !Ref DatapointsToAlarm
+      TreatMissingData: notBreaching
+      ActionLogLineCount: !Ref ActionLogLineCount
+      ActionLogLineRoleArn: !GetAtt LogLineRetrievalRole.Arn
+      AlarmActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+      OKActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+
+  # ---------------------------------------------------------------------------
+  # ALARM: Sustained Startup Probe Failures
+  # ---------------------------------------------------------------------------
+  StartupProbeFailuresAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: StartupProbeFailuresEnabled
+    Properties:
+      AlarmName: !Sub "${ClusterName}-startup-probe-failures"
+      AlarmDescription: >
+        Containers stuck failing startup probes, blocking deployment rollouts.
+        Generic probe metric exists but lacks per-container/node detail.
+      ScheduledQueryConfiguration:
+        QueryString: |
+          filter @logStream like /kube-apiserver-audit/
+          | filter objectRef.resource = "events"
+          | filter requestObject.message like /Startup probe failed/
+          | stats count(*) as probeFailures by bin(5m)
+        LogGroupIdentifiers:
+          - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/cluster"
+        AggregationExpression: "sum(probeFailures)"
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryRole.Arn
+        ScheduleConfiguration:
+          ScheduleExpression: !Ref QuerySchedule
+          StartTimeOffset: !Ref LookbackWindowSeconds
+          EndTimeOffset: 0
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      QueryResultsToEvaluate: !Ref EvaluationPeriods
+      QueryResultsToAlarm: !Ref DatapointsToAlarm
+      TreatMissingData: notBreaching
+      ActionLogLineCount: !Ref ActionLogLineCount
+      ActionLogLineRoleArn: !GetAtt LogLineRetrievalRole.Arn
+      AlarmActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+      OKActions:
+        - !If [ShouldCreateSNSTopic, !Ref AlarmSNSTopic, !Ref ExistingSNSTopicARN]
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  SNSTopicARN:
+    Description: ARN of the SNS topic receiving alarm notifications
+    Value: !If
+      - ShouldCreateSNSTopic
+      - !Ref AlarmSNSTopic
+      - !Ref ExistingSNSTopicARN
+
+  ScheduledQueryRoleARN:
+    Description: ARN of the IAM role used for scheduled query execution
+    Value: !GetAtt ScheduledQueryRole.Arn
+
+  LogLineRetrievalRoleARN:
+    Description: ARN of the IAM role used for log line retrieval in notifications
+    Value: !GetAtt LogLineRetrievalRole.Arn
+
+  ControlPlaneLogGroup:
+    Description: The EKS control plane log group being monitored
+    Value: !Sub "/aws/eks/${ClusterName}/cluster"
+
+  EnabledAlarms:
+    Description: Summary of enabled alarm patterns
+    Value: !Sub >
+      WebhookFailures=${EnableWebhookFailures},
+      WebhookLatency=${EnableWebhookLatency},
+      APIServerHealthCheck=${EnableAPIServerHealthCheck},
+      APIThrottling=${EnableAPIThrottling},
+      PDBEvictionBlocked=${EnablePDBEvictionBlocked},
+      AuthDenied=${EnableAuthDenied},
+      NoisyClient=${EnableNoisyClient},
+      StartupProbeFailures=${EnableStartupProbeFailures}
+
+  StackVersion:
+    Description: Version of the EKS Log Alarms template
+    Value: "2.0.0"

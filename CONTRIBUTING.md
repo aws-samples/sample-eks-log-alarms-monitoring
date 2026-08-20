@@ -7,6 +7,92 @@ Please read through this document before submitting any issues or pull requests 
 information to effectively respond to your bug report or contribution.
 
 
+## Adding a New Alarm Pattern
+
+### 1. Design the Query
+
+Start by testing your Logs Insights query in the CloudWatch console:
+
+1. Go to CloudWatch → Logs Insights
+2. Select the relevant EKS log group(s)
+3. Write and test your query
+4. Verify it returns meaningful results for the failure mode you're targeting
+
+**Query guidelines:**
+- Use specific `filter` clauses to avoid false positives
+- Include `stats count(*) as <metricName> by bin(5m)` for aggregation
+- Test with both "quiet" and "noisy" time periods
+- Consider using `parse` to extract structured fields for richer context
+
+### 2. Add to the CloudFormation Template
+
+Add your alarm resource to `template.yaml`:
+
+1. Add a parameter for the enable toggle:
+```yaml
+EnableMyNewAlarm:
+  Type: String
+  Default: "true"
+  AllowedValues: ["true", "false"]
+  Description: Enable alarm for <your pattern description>
+```
+
+2. Add a condition:
+```yaml
+MyNewAlarmEnabled: !Equals [!Ref EnableMyNewAlarm, "true"]
+```
+
+3. Add the alarm resource following the existing pattern structure. Set the
+   `Threshold` directly on the alarm resource (thresholds are per-alarm values
+   in this template, not parameters) and reuse the shared schedule/evaluation
+   parameters (`QuerySchedule`, `LookbackWindowSeconds`, `EvaluationPeriods`,
+   `DatapointsToAlarm`).
+
+### 3. Document the Pattern
+
+Add an entry to `docs/alarm-patterns.md` with:
+- What it detects
+- Why it matters
+- The query with explanation
+- Default threshold and tuning guidance
+- Response runbook
+
+### 4. Update the README
+
+Add a row to the alarm table in `README.md`.
+
+## Testing
+
+Before submitting:
+
+1. **Validate the template:**
+```bash
+aws cloudformation validate-template --template-body file://template.yaml
+```
+
+2. **Deploy to a test cluster:**
+```bash
+./examples/deploy.sh <test-cluster-name> your-email@example.com
+```
+
+3. **Verify alarms appear** (requires AWS CLI v2.36+ for the LogAlarm type):
+```bash
+aws cloudwatch describe-alarms \
+  --alarm-name-prefix "<cluster-name>-" \
+  --alarm-types LogAlarm
+```
+
+4. **Trigger the condition** (if possible in a test environment) and verify the alarm transitions to ALARM state. Add a trigger function for your alarm to `tests/trigger.sh` and matching removal steps to `tests/cleanup.sh` — every test must be cleanly reversible.
+
+## Code Style
+
+- Use consistent YAML indentation (2 spaces)
+- Include `AlarmDescription` that explains the alarm to an on-call engineer at 3 AM
+- Always include both `AlarmActions` and `OKActions`
+- Set `TreatMissingData: notBreaching` unless there's a specific reason not to
+- Include `ActionLogLineCount` for context in notifications
+
+
 ## Reporting Bugs/Feature Requests
 
 We welcome you to use the GitHub issue tracker to report bugs or suggest features.

@@ -1,0 +1,21 @@
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Security scan output
+.ash/
+
+# Python
+__pycache__/
+*.pyc
+
+# CloudFormation packaging
+packaged.yaml
+
+# APG pattern drafts live in AWS Prescriptive Guidance, not in this repository
+docs/apg-pattern.md
